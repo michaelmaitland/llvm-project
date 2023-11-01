@@ -121,22 +121,23 @@ RegSizeInfo::RegSizeInfo(Record *R, const CodeGenHwModes &CGH) {
   RegSize = R->getValueAsInt("RegSize");
   SpillSize = R->getValueAsInt("SpillSize");
   SpillAlignment = R->getValueAsInt("SpillAlignment");
+  Scalable = R->getValueAsInt("Scalable");
 }
 
 bool RegSizeInfo::operator< (const RegSizeInfo &I) const {
-  return std::tie(RegSize, SpillSize, SpillAlignment) <
-         std::tie(I.RegSize, I.SpillSize, I.SpillAlignment);
+  return std::tie(RegSize, SpillSize, SpillAlignment, Scalable) <
+         std::tie(I.RegSize, I.SpillSize, I.SpillAlignment, Scalable);
 }
 
 bool RegSizeInfo::isSubClassOf(const RegSizeInfo &I) const {
-  return RegSize <= I.RegSize &&
-         SpillAlignment && I.SpillAlignment % SpillAlignment == 0 &&
-         SpillSize <= I.SpillSize;
+  return RegSize <= I.RegSize && SpillAlignment &&
+         I.SpillAlignment % SpillAlignment == 0 && SpillSize <= I.SpillSize &&
+         Scalable == I.Scalable;
 }
 
 void RegSizeInfo::writeToStream(raw_ostream &OS) const {
-  OS << "[R=" << RegSize << ",S=" << SpillSize
-     << ",A=" << SpillAlignment << ']';
+  OS << "[R=" << RegSize << ",S=" << SpillSize << ",A=" << SpillAlignment
+     << ",Sc=" << Scalable << ']';
 }
 
 RegSizeInfoByHwMode::RegSizeInfoByHwMode(Record *R,

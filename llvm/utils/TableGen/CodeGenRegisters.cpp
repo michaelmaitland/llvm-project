@@ -796,6 +796,7 @@ CodeGenRegisterClass::CodeGenRegisterClass(CodeGenRegBank &RegBank, Record *R)
     RI.RegSize = RI.SpillSize = Size ? Size
                                      : VTs[0].getSimple().getSizeInBits();
     RI.SpillAlignment = R->getValueAsInt("Alignment");
+    RI.Scalable = R->getValueAsBit("Scalable");
     RSI.insertRegSizeForMode(DefaultMode, RI);
   }
 

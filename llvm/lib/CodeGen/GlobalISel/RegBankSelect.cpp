@@ -277,7 +277,7 @@ uint64_t RegBankSelect::getRepairCost(
     // We would also need to propagate this information in the
     // repairing placement.
     unsigned Cost = RBI->copyCost(*DesiredRegBank, *CurRegBank,
-                                  RBI->getSizeInBits(MO.getReg(), *MRI, *TRI));
+                                  RBI->getSizeInBitsS(MO.getReg(), *MRI, *TRI));
     // TODO: use a dedicated constant for ImpossibleCost.
     if (Cost != std::numeric_limits<unsigned>::max())
       return Cost;

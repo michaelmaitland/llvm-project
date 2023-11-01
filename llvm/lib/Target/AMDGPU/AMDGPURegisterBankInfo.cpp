@@ -229,7 +229,7 @@ bool AMDGPURegisterBankInfo::isDivergentRegBank(const RegisterBank *RB) const {
 
 unsigned AMDGPURegisterBankInfo::copyCost(const RegisterBank &Dst,
                                           const RegisterBank &Src,
-                                          unsigned Size) const {
+                                          TypeSize Size) const {
   // TODO: Should there be a UniformVGPRRegBank which can use readfirstlane?
   if (Dst.getID() == AMDGPU::SGPRRegBankID &&
       (isVectorRegisterBank(Src) || Src.getID() == AMDGPU::VCCRegBankID)) {
@@ -243,10 +243,8 @@ unsigned AMDGPURegisterBankInfo::copyCost(const RegisterBank &Dst,
   // Legalization doesn't know about the necessary context, so an s1 use may
   // have been a truncate from an arbitrary value, in which case a copy (lowered
   // as a compare with 0) needs to be inserted.
-  if (Size == 1 &&
-      (Dst.getID() == AMDGPU::SGPRRegBankID) &&
-      (isVectorRegisterBank(Src) ||
-       Src.getID() == AMDGPU::SGPRRegBankID ||
+  if (Size == TypeSize::Fixed(1) && (Dst.getID() == AMDGPU::SGPRRegBankID) &&
+      (isVectorRegisterBank(Src) || Src.getID() == AMDGPU::SGPRRegBankID ||
        Src.getID() == AMDGPU::VCCRegBankID))
     return std::numeric_limits<unsigned>::max();
 
@@ -3541,7 +3539,7 @@ AMDGPURegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
 
     unsigned Size = getSizeInBits(MI.getOperand(0).getReg(), MRI, *TRI);
     if (MI.getOpcode() != AMDGPU::G_FREEZE &&
-        cannotCopy(*DstBank, *SrcBank, Size))
+        cannotCopy(*DstBank, *SrcBank, TypeSize::Fixed(Size)))
       return getInvalidInstructionMapping();
 
     const ValueMapping &ValMap = getValueMapping(0, Size, *DstBank);

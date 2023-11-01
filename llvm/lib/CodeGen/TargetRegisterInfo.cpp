@@ -500,16 +500,23 @@ bool TargetRegisterInfo::regmaskSubsetEqual(const uint32_t *mask0,
 }
 
 TypeSize
-TargetRegisterInfo::getRegSizeInBits(Register Reg,
-                                     const MachineRegisterInfo &MRI) const {
+TargetRegisterInfo::getRegSizeInBitsS(Register Reg,
+                                      const MachineRegisterInfo &MRI) const {
   const TargetRegisterClass *RC{};
   if (Reg.isPhysical()) {
     // The size is not directly available for physical registers.
     // Instead, we need to access a register class that contains Reg and
     // get the size of that register class.
     RC = getMinimalPhysRegClass(Reg);
-    assert(RC && "Unable to deduce the register class");
-    return getRegSizeInBits(*RC);
+  } else {
+    LLT Ty = MRI.getType(Reg);
+    TypeSize RegSize = Ty.isValid() ? Ty.getSizeInBits() : TypeSize::Fixed(0);
+    // If Reg is not a generic register, query the register class to
+    // get its size.
+    if (RegSize)
+      return RegSize;
+    // Since Reg is not a generic register, it must have a register class.
+    RC = MRI.getRegClass(Reg);
   }
   LLT Ty = MRI.getType(Reg);
   if (Ty.isValid())
@@ -518,7 +525,15 @@ TargetRegisterInfo::getRegSizeInBits(Register Reg,
   // Since Reg is not a generic register, it may have a register class.
   RC = MRI.getRegClass(Reg);
   assert(RC && "Unable to deduce the register class");
-  return getRegSizeInBits(*RC);
+  return TypeSize::Fixed(getRegSizeInBits(*RC));
+}
+
+unsigned
+TargetRegisterInfo::getRegSizeInBits(Register Reg,
+                                     const MachineRegisterInfo &MRI) const {
+  TypeSize TS = getRegSizeInBitsS(Reg, MRI);
+  assert(!TS.isScalable() && "Unexpected Scalable register size");
+  return TS.getFixedValue();
 }
 
 bool TargetRegisterInfo::getCoveringSubRegIndexes(
