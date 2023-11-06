@@ -1290,8 +1290,8 @@ RegisterInfoEmitter::runTargetDesc(raw_ostream &OS, CodeGenTarget &Target,
         for (const ValueTypeByHwMode &VVT : RC.VTs)
           if (VVT.hasDefault() || VVT.hasMode(M))
             VTs.push_back(VVT.get(M).SimpleTy);
-        OS << ", /*VTLists+*/" << VTSeqs.get(VTs) << ", " << RI.Scalable
-           << " },    // " << RC.getName() << '\n';
+        OS << ", /*VTLists+*/" << VTSeqs.get(VTs) << " },    // "
+           << RC.getName() << '\n';
       }
     }
     OS << "};\n";

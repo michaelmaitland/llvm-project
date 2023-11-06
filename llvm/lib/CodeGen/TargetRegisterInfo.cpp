@@ -518,12 +518,6 @@ TargetRegisterInfo::getRegSizeInBitsS(Register Reg,
     // Since Reg is not a generic register, it must have a register class.
     RC = MRI.getRegClass(Reg);
   }
-  LLT Ty = MRI.getType(Reg);
-  if (Ty.isValid())
-    return Ty.getSizeInBits();
-
-  // Since Reg is not a generic register, it may have a register class.
-  RC = MRI.getRegClass(Reg);
   assert(RC && "Unable to deduce the register class");
   return TypeSize::Fixed(getRegSizeInBits(*RC));
 }

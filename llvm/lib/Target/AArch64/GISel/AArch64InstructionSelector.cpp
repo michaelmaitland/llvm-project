@@ -1022,8 +1022,8 @@ static bool selectCopy(MachineInstr &I, const TargetInstrInfo &TII,
       return false;
     }
 
-    TypeSize SrcSize = TRI.getRegSizeInBitsS(*SrcRC);
-    TypeSize DstSize = TRI.getRegSizeInBitsS(*DstRC);
+    TypeSize SrcSize = TypeSize::Fixed(TRI.getRegSizeInBits(*SrcRC));
+    TypeSize DstSize = TypeSize::Fixed(TRI.getRegSizeInBits(*DstRC));
     unsigned SubReg;
 
     if (SrcSize.isScalable()) {

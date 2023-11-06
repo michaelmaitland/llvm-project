@@ -1937,28 +1937,28 @@ void MachineVerifier::visitMachineInstrBefore(const MachineInstr *MI) {
 
     // If we have only one valid type, this is likely a copy between a virtual
     // and physical register.
-    TypeSize SrcSize = TRI->getRegSizeInBits(SrcReg, *MRI);
-    TypeSize DstSize = TRI->getRegSizeInBits(DstReg, *MRI);
+    TypeSize SrcSize = TRI->getRegSizeInBitsS(SrcReg, *MRI);
+    TypeSize DstSize = TRI->getRegSizeInBitsS(DstReg, *MRI);
 
     if (SrcReg.isPhysical() && DstTy.isValid()) {
       const TargetRegisterClass *SrcRC =
           TRI->getMinimalPhysRegClassLLT(SrcReg, DstTy);
       if (SrcRC)
-        SrcSize = TRI->getRegSizeInBits(*SrcRC);
+        SrcSize = TypeSize::Fixed(TRI->getRegSizeInBits(*SrcRC));
     }
 
     if (SrcSize.isZero())
-      SrcSize = TRI->getRegSizeInBits(SrcReg, *MRI);
+      SrcSize = TRI->getRegSizeInBitsS(SrcReg, *MRI);
 
     if (DstReg.isPhysical() && SrcTy.isValid()) {
       const TargetRegisterClass *DstRC =
           TRI->getMinimalPhysRegClassLLT(DstReg, SrcTy);
       if (DstRC)
-        DstSize = TRI->getRegSizeInBits(*DstRC);
+        DstSize = TypeSize::Fixed(TRI->getRegSizeInBits(*DstRC));
     }
 
     if (DstSize.isZero())
-      DstSize = TRI->getRegSizeInBits(DstReg, *MRI);
+      DstSize = TRI->getRegSizeInBitsS(DstReg, *MRI);
 
     // If the Dst is scalable and the Src is fixed, then the Dst can only hold
     // the Src if the minimum size Dst can hold is at least as big as Src.
@@ -2266,8 +2266,8 @@ MachineVerifier::visitMachineOperand(const MachineOperand *MO, unsigned MONum) {
           }
 
           // Make sure the register fits into its register bank if any.
-          if (RegBank && Ty.isValid() &&
-              RBI->getMaximumSize(RegBank->getID()) < Ty.getSizeInBits()) {
+          if (RegBank && Ty.isValid() && (!Ty.isScalable() &&
+              RBI->getMaximumSize(RegBank->getID()) < Ty.getSizeInBits())) {
             report("Register bank is too small for virtual register", MO,
                    MONum);
             errs() << "Register bank " << RegBank->getName() << " too small("

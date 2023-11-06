@@ -100,6 +100,26 @@ RISCVRegisterBankInfo::getRegBankFromRegClass(const TargetRegisterClass &RC,
   case RISCV::FPR64CRegClassID:
   case RISCV::FPR32CRegClassID:
     return getRegBank(RISCV::FPRRegBankID);
+  case RISCV::VRRegClassID:
+    return getRegBank(RISCV::VRRegBankID);
+  case RISCV::VRNoV0RegClassID:
+    return getRegBank(RISCV::VRNoV0RegBankID);
+  case RISCV::VRM2RegClassID:
+    return getRegBank(RISCV::VRM2RegBankID);
+  case RISCV::VRM2NoV0RegClassID:
+    return getRegBank(RISCV::VRM2NoV0RegBankID);
+  case RISCV::VRM4RegClassID:
+    return getRegBank(RISCV::VRM4RegBankID);
+  case RISCV::VRM4NoV0RegClassID:
+    return getRegBank(RISCV::VRM4NoV0RegBankID);
+  case RISCV::VRM8RegClassID:
+    return getRegBank(RISCV::VRM8RegBankID);
+  case RISCV::VRM8NoV0RegClassID:
+    return getRegBank(RISCV::VRM8NoV0RegBankID);
+  case RISCV::VMRegClassID:
+    return getRegBank(RISCV::VMRegBankID);
+  case RISCV::VMV0RegClassID:
+    return getRegBank(RISCV::VMV0RegBankID);
   }
 }
 
@@ -185,7 +205,7 @@ RISCVRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
   case TargetOpcode::G_FMAXNUM:
   case TargetOpcode::G_FMINNUM: {
     LLT Ty = MRI.getType(MI.getOperand(0).getReg());
-    OperandsMapping = Ty.getSizeInBits() == 64
+    OperandsMapping = Ty.getSizeInBits() == TypeSize::Fixed(64)
                           ? &RISCV::ValueMappings[RISCV::FPR64Idx]
                           : &RISCV::ValueMappings[RISCV::FPR32Idx];
     break;
@@ -193,7 +213,7 @@ RISCVRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
   case TargetOpcode::G_FMA: {
     LLT Ty = MRI.getType(MI.getOperand(0).getReg());
     OperandsMapping =
-        Ty.getSizeInBits() == 64
+        Ty.getSizeInBits() == TypeSize::Fixed(64)
             ? getOperandsMapping({&RISCV::ValueMappings[RISCV::FPR64Idx],
                                   &RISCV::ValueMappings[RISCV::FPR64Idx],
                                   &RISCV::ValueMappings[RISCV::FPR64Idx],
@@ -209,7 +229,8 @@ RISCVRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
     (void)ToTy;
     LLT FromTy = MRI.getType(MI.getOperand(1).getReg());
     (void)FromTy;
-    assert(ToTy.getSizeInBits() == 64 && FromTy.getSizeInBits() == 32 &&
+    assert(ToTy.getSizeInBits() == TypeSize::Fixed(64) &&
+           FromTy.getSizeInBits() == TypeSize::Fixed(32) &&
            "Unsupported size for G_FPEXT");
     OperandsMapping =
         getOperandsMapping({&RISCV::ValueMappings[RISCV::FPR64Idx],
@@ -221,7 +242,8 @@ RISCVRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
     (void)ToTy;
     LLT FromTy = MRI.getType(MI.getOperand(1).getReg());
     (void)FromTy;
-    assert(ToTy.getSizeInBits() == 32 && FromTy.getSizeInBits() == 64 &&
+    assert(ToTy.getSizeInBits() == TypeSize::Fixed(32) &&
+           FromTy.getSizeInBits() == TypeSize::Fixed(64) &&
            "Unsupported size for G_FPTRUNC");
     OperandsMapping =
         getOperandsMapping({&RISCV::ValueMappings[RISCV::FPR32Idx],
