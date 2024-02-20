@@ -193,6 +193,15 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
 
   getActionDefinitionsBuilder(G_IMPLICIT_DEF)
       .legalFor({s32, sXLen, p0})
+      .legalIf(all(
+          typeInSet(0, AllVecTys),
+          LegalityPredicate([=, &ST](const LegalityQuery &Query) {
+            return ST.hasVInstructions() &&
+                   (Query.Types[0].getScalarSizeInBits() != 64 ||
+                    ST.hasVInstructionsI64()) &&
+                   (Query.Types[0].getElementCount().getKnownMinValue() != 1 ||
+                    ST.getELen() == 64);
+          })))
       .widenScalarToNextPow2(0)
       .clampScalar(0, s32, sXLen);
 
@@ -373,6 +382,22 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
       // outside the [s32, sXLen] range.
       .clampScalar(0, s32, sXLen)
       .lowerForCartesianProduct({s32, sXLen, p0}, {p0});
+
+  getActionDefinitionsBuilder(G_INSERT_VECTOR_ELT)
+      .legalIf(all(
+          typeInSet(0, AllVecTys),
+          // TODO: Handle insertion of i64-element on RV32
+          typeInSet(1, {s8, s16, s32, sXLen}),
+          typeInSet(2, {s8, s16, s32, sXLen}),
+          LegalityPredicate([=, &ST](const LegalityQuery &Query) {
+            return ST.hasVInstructions() &&
+                   (Query.Types[0].getScalarSizeInBits() != 64 ||
+                    ST.hasVInstructionsI64()) &&
+                   (Query.Types[0].getElementCount().getKnownMinValue() != 1 ||
+                    ST.getELen() == 64);
+          })))
+      .clampScalar(2, s32, sXLen);
+
 
   getLegacyLegalizerInfo().computeTables();
 }

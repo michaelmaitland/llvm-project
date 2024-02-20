@@ -351,6 +351,11 @@ RISCVRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
     // $f10_d = COPY %1(s32)
     if (anyUseOnlyUseFP(Dst, MRI, TRI))
       Mapping = getFPValueMapping(MRI.getType(Dst).getSizeInBits());
+
+    LLT DstTy = MRI.getType(Dst);
+    if (DstTy.isVector())
+      Mapping = getVRBValueMapping(DstTy.getSizeInBits().getKnownMinValue());
+
     return getInstructionMapping(DefaultMappingID, /*Cost=*/1, Mapping,
                                  NumOperands);
   }
@@ -499,6 +504,22 @@ RISCVRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
       OpdsMapping[1] = GPRValueMapping;
       OpdsMapping[2] = getFPValueMapping(Ty.getSizeInBits());
     }
+    break;
+  }
+  case TargetOpcode::G_INSERT_VECTOR_ELT: {
+    LLT Ty = MRI.getType(MI.getOperand(0).getReg());
+    auto VRBMapping = getVRBValueMapping(Ty.getSizeInBits().getKnownMinValue());
+    OpdsMapping[0] = VRBMapping;
+    OpdsMapping[1] = VRBMapping;
+
+    // FIXME: May need to use anyUseOnlyUseFP in the future, but need to extend
+    // anyUseOnlyUseFP to support FP vectors.
+    MachineInstr *EltDefMI = MRI.getVRegDef(MI.getOperand(2).getReg());
+    OpdsMapping[2] = GPRValueMapping;
+    if (onlyDefinesFP(*EltDefMI, MRI, TRI))
+      OpdsMapping[2] = getFPValueMapping(Ty.getSizeInBits());
+
+    OpdsMapping[3] = GPRValueMapping;
     break;
   }
   default:
