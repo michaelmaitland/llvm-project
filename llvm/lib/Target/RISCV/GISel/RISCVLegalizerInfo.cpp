@@ -384,10 +384,10 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
       .lowerForCartesianProduct({s32, sXLen, p0}, {p0});
 
   getActionDefinitionsBuilder(G_INSERT_VECTOR_ELT)
-      .legalIf(all(
+      .customIf(all(
           typeInSet(0, AllVecTys),
-          // TODO: Handle insertion of i64-element on RV32
-          typeInSet(1, {s8, s16, s32, sXLen}),
+          // i64-element vectors on RV32 may be legalized in certain cases.
+          typeInSet(1, {s8, s16, s32, s64}),
           typeInSet(2, {s8, s16, s32, sXLen}),
           LegalityPredicate([=, &ST](const LegalityQuery &Query) {
             return ST.hasVInstructions() &&
@@ -397,7 +397,6 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
                     ST.getELen() == 64);
           })))
       .clampScalar(2, s32, sXLen);
-
 
   getLegacyLegalizerInfo().computeTables();
 }
@@ -520,6 +519,299 @@ bool RISCVLegalizerInfo::shouldBeInConstantPool(APInt APImm,
   return !(!SeqLo.empty() && (SeqLo.size() + 2) <= STI.getMaxBuildIntsCost());
 }
 
+static LLT getLMUL1Ty(LLT VecTy) {
+  assert(VecTy.getElementType().getSizeInBits() <= 64 &&
+         "Unexpected vector LLT");
+  return LLT::scalable_vector(RISCV::RVVBitsPerBlock /
+                                  VecTy.getElementType().getSizeInBits(),
+                              VecTy.getElementType());
+}
+
+// Given a scalable vector type and an index into it, returns the type for the
+// smallest subvector that the index fits in. This can be used to reduce LMUL
+// for operations like vslidedown.
+//
+// E.g. With Zvl128b, index 3 in a nxv4i32 fits within the first nxv2i32.
+static std::optional<LLT>
+getSmallestLLTForIndex(LLT VecTy, unsigned MaxIdx,
+                       const RISCVSubtarget &Subtarget) {
+  assert(VecTy.isScalableVector());
+  const unsigned EltSize = VecTy.getScalarSizeInBits();
+  const unsigned VectorBitsMin = Subtarget.getRealMinVLen();
+  const unsigned MinVLMAX = VectorBitsMin / EltSize;
+  LLT SmallerTy;
+  if (MaxIdx < MinVLMAX)
+    SmallerTy = getLMUL1Ty(VecTy);
+  else if (MaxIdx < MinVLMAX * 2)
+    SmallerTy  = getLMUL1Ty(VecTy).multiplyElements(2);
+  else if (MaxIdx < MinVLMAX * 4)
+    SmallerTy = getLMUL1Ty(VecTy).multiplyElements(4);
+  if (!SmallerTy.isValid() ||
+      !TypeSize::isKnownGT(VecTy.getSizeInBits(), SmallerTy.getSizeInBits()))
+    return std::nullopt;
+  return SmallerTy;
+}
+
+/// Return the type of the mask type suitable for masking the provided
+/// vector type.  This is simply an i1 element type vector of the same
+/// (possibly scalable) length.
+static LLT getMaskTypeFor(LLT VecTy) {
+  assert(VecTy.isVector());
+  ElementCount EC = VecTy.getElementCount();
+  return LLT::vector(EC, LLT::scalar(1));
+}
+
+/// Creates an all ones mask suitable for masking a vector of type VecTy with
+/// vector length VL.
+static MachineInstrBuilder buildAllOnesMask(LLT VecTy, const SrcOp &VL,
+                                            MachineIRBuilder &MIB,
+                                            MachineRegisterInfo &MRI) {
+  LLT MaskTy = getMaskTypeFor(VecTy);
+  return MIB.buildInstr(RISCV::G_VMSET_VL, {MaskTy}, {VL});
+}
+
+/// Gets the two common "VL" operands: an all-ones mask and the vector length.
+/// VecTy is a scalable vector type.
+static std::pair<MachineInstrBuilder, Register>
+buildDefaultVLOps(const DstOp &Dst, MachineIRBuilder &MIB,
+                  MachineRegisterInfo &MRI) {
+  LLT VecTy = Dst.getLLTTy(MRI);
+  assert(VecTy.isScalableVector() && "Expecting scalable container type");
+  Register VL(RISCV::X0);
+  MachineInstrBuilder Mask = buildAllOnesMask(VecTy, VL, MIB, MRI);
+  return {Mask, VL};
+}
+
+static MachineInstrBuilder
+buildSplatPartsI64WithVL(const DstOp &Dst, const SrcOp &Passthru, Register Lo,
+                         Register Hi, Register VL, MachineIRBuilder &MIB,
+                         MachineRegisterInfo &MRI) {
+
+  if (std::optional<int64_t> LoC = getIConstantSplatSExtVal(Lo, MRI),
+      HiC = getIConstantSplatSExtVal(Hi, MRI);
+      LoC && HiC) {
+    // If Hi constant is all the same sign bit as Lo, lower this as a custom
+    // node in order to try and match RVV vector/scalar instructions.
+    if ((*LoC >> 31) == *HiC)
+      return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst}, {Passthru, Lo, VL});
+
+    // If vl is equal to VLMAX or fits in 4 bits and Hi constant is equal to Lo,
+    // we could use vmv.v.x whose EEW = 32 to lower it. This allows us to use
+    // vlmax vsetvli or vsetivli to change the VL.
+    // FIXME: Support larger constants?
+    // FIXME: Support non-constant VLs by saturating?
+    Register NewVL = VL;
+    if (*LoC == *HiC) {
+      if (isAllOnesOrAllOnesSplat(*MRI.getVRegDef(VL), MRI) || VL == RISCV::X0)
+        NewVL = Register(RISCV::X0);
+      else if (auto VLC = getIConstantSplatVal(VL, MRI);
+               isUInt<4>(VLC->getZExtValue()))
+        NewVL = MIB.buildAdd({MRI.getType(VL)}, VL, VL).getReg(0);
+
+      if (NewVL) {
+        LLT InterVecTy = LLT::vector(
+            Dst.getLLTTy(MRI).getElementCount().multiplyCoefficientBy(2), 32);
+        auto InterVec = MIB.buildInstr(RISCV::G_VMV_V_X_VL, {InterVecTy},
+                                       {MIB.buildUndef(InterVecTy), Lo, NewVL});
+        return MIB.buildBitcast(Dst, InterVec);
+      }
+    }
+  }
+
+  // Detect cases where Hi is (SRA Lo, 31) which means Hi is Lo sign extended.
+  MachineInstr *HiMI = MRI.getVRegDef(Hi);
+  MachineInstr *HiMiOp2Def = MRI.getVRegDef(HiMI->getOperand(2).getReg());
+  if (HiMI->getOpcode() == TargetOpcode::G_ASHR &&
+      HiMI->getOperand(1).getReg() == Lo)
+    if (auto C = getIConstantSplatSExtVal(*HiMiOp2Def, MRI); *C == 31)
+      return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst}, {Passthru, Lo, VL});
+
+  // If the Hi bits of the splat are undefined, then it's fine to just splat
+  // Lo even if it might be sign extended.
+  if (HiMI->getOpcode() == TargetOpcode::G_IMPLICIT_DEF)
+    return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst}, {Passthru, Lo, VL});
+
+  // Fall back to a stack store and stride x0 vector load.
+  // TODO: need to lower G_SPLAT_VECTOR_SPLIT_I64. This is done in
+  // preprocessDAG in SDAG.
+  return MIB.buildInstr(RISCV::G_SPLAT_VECTOR_SPLIT_I64_VL, {Dst},
+                        {Passthru, Lo, Hi, VL});
+}
+
+static MachineInstrBuilder
+buildSplatSplitI64WithVL(const DstOp &Dst, const SrcOp &Passthru,
+                         const SrcOp &Scalar, Register VL,
+                         MachineIRBuilder &MIB, MachineRegisterInfo &MRI) {
+  assert(Scalar.getLLTTy(MRI) == LLT::scalar(64) && "Unexpected VecTy!");
+  auto Unmerge = MIB.buildUnmerge(LLT::scalar(32), Scalar);
+  return buildSplatPartsI64WithVL(Dst, Passthru, Unmerge.getReg(0),
+                                  Unmerge.getReg(1), VL, MIB, MRI);
+}
+
+static MachineInstrBuilder
+buildScalarSplat(const DstOp &Dst, const SrcOp &Passthru, Register Scalar,
+                 Register VL, MachineIRBuilder &MIB, MachineRegisterInfo &MRI,
+                 const RISCVSubtarget &Subtarget) {
+  if (isRegInFprb(Scalar, MRI))
+    return MIB.buildInstr(RISCV::G_VFMV_V_F_VL, {Dst}, {Passthru, Scalar, VL});
+
+  const LLT XLenTy(Subtarget.getXLenVT());
+
+  // Simplest case is that the operand needs to be promoted to XLenTy.
+  LLT ScalarTy = MRI.getType(Scalar);
+  if (TypeSize::isKnownLE(ScalarTy.getSizeInBits(), XLenTy.getSizeInBits())) {
+    // If the operand is a constant, sign extend to increase our chances
+    // of being able to use a .vi instruction. ANY_EXTEND would become a
+    // a zero extend and the simm5 check in isel would fail.
+    // FIXME: Should we ignore the upper bits in isel instead?
+    unsigned ExtOpc = isConstantOrConstantVector(*MRI.getVRegDef(Scalar), MRI)
+                          ? TargetOpcode::G_SEXT
+                          : TargetOpcode::G_ANYEXT;
+    auto ExtScalar = MIB.buildInstr(ExtOpc, {XLenTy}, {Scalar});
+    return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst},
+                          {Passthru, ExtScalar, VL});
+  }
+
+  assert(XLenTy == LLT::scalar(32) && ScalarTy == LLT::scalar(64) &&
+         "Unexpected scalar for splat lowering!");
+
+  if (isAllOnesOrAllOnesSplat(*MRI.getVRegDef(VL), MRI) &&
+      isNullOrNullSplat(*MRI.getVRegDef(Scalar), MRI))
+    return MIB.buildInstr(RISCV::G_VMV_S_X_VL, {Dst},
+                          {Passthru, MIB.buildConstant(XLenTy, 0), VL});
+
+  // Otherwise use the more complicated splatting algorithm.
+  return buildSplatSplitI64WithVL(Dst, Passthru, Scalar, VL, MIB, MRI);
+}
+
+static MachineInstrBuilder
+buildScalarInsert(const DstOp &Dst, Register Scalar, const SrcOp &VL,
+                  MachineIRBuilder &MIB, MachineRegisterInfo &MRI,
+                  const RISCVSubtarget &Subtarget) {
+  LLT VecTy = Dst.getLLTTy(MRI);
+  assert(VecTy.isScalableVector() && "Expect Dst is scalable vector type.");
+
+  const LLT XLenTy(Subtarget.getXLenVT());
+
+  auto Undef = MIB.buildUndef(VecTy);
+  if (isRegInFprb(Scalar, MRI))
+    return MIB.buildInstr(RISCV::G_VFMV_S_F_VL, {Dst}, {Undef, Scalar, VL});
+
+  // Avoid the tricky legalization cases by falling back to using the
+  // splat code which already handles it gracefully.
+  LLT ScalarTy = MRI.getType(Scalar);
+  if (!TypeSize::isKnownLE(ScalarTy.getSizeInBits(), XLenTy.getSizeInBits()))
+    return buildScalarSplat(Dst, Undef, Scalar,
+                            MIB.buildConstant(XLenTy, 1).getReg(0), MIB, MRI,
+                            Subtarget);
+
+  // TODO: check whether we need the EXTEND that SelectionDAG has.
+  return MIB.buildInstr(RISCV::G_VMV_S_X_VL, {Dst}, {Undef, Scalar, VL});
+}
+
+/// Insert into the first position of a vector, and that vector is slid up to the
+/// insert index. By limiting the active vector length to index+1 and merging
+/// with the original vector (with an undisturbed tail policy for elements >=
+/// VL), we achieve the desired result of leaving all elements untouched except
+/// the one at VL-1, which is replaced with the desired value.
+bool RISCVLegalizerInfo::legalizeInsertVectorElt(MachineInstr &MI,
+                                                 MachineIRBuilder &MIB) const {
+  assert(MI.getOpcode() == TargetOpcode::G_INSERT_VECTOR_ELT);
+
+  MachineRegisterInfo &MRI = *MIB.getMRI();
+
+  Register Dst = MI.getOperand(0).getReg();
+  Register SrcVec = MI.getOperand(1).getReg();
+  Register Elt = MI.getOperand(2).getReg();
+  Register Idx = MI.getOperand(3).getReg();
+
+  LLT VecTy = MRI.getType(Dst);
+  const LLT EltTy = VecTy.getElementType();
+  const LLT XLenTy(STI.getXLenVT());
+
+  // FIXME: SelectionDAG promotes a s1 vector type to s8 vector type at this
+  // point. GISel should take care of this during legalization. For now, the
+  // legalizer will return not legal.
+
+  // If we know the index we're going to insert at, we can shrink Vec so that
+  // we're performing the scalar inserts and slideup on a smaller LMUL.
+
+  // If we can shrink the vector type, then a G_EXTRACT will be used to the the
+  // smaller vector. The insertion will occur on that smaller vector, and then
+  // a G_INSERT will be used to put the result back into the larger, original
+  // vector.
+  unsigned AlignedIdx = 0;
+  auto InsertVec = SrcVec;
+  if (auto ConstIdxOpt = getIConstantVRegVal(Idx, MRI)) {
+    const unsigned OrigIdx = ConstIdxOpt->getZExtValue();
+    // Do we know an upper bound on LMUL?
+    if (auto ShrunkTy = getSmallestLLTForIndex(VecTy, OrigIdx, STI))
+      VecTy = *ShrunkTy;
+
+    // If we're compiling for an exact VLEN value, we can always perform
+    // the insert in m1 as we can determine the register corresponding to
+    // the index in the register group.
+    const unsigned MinVLen = STI.getRealMinVLen();
+    const unsigned MaxVLen = STI.getRealMaxVLen();
+    const LLT M1Ty = getLMUL1Ty(VecTy);
+    if (MinVLen == MaxVLen &&
+        TypeSize::isKnownGT(VecTy.getSizeInBits(), M1Ty.getSizeInBits())) {
+      unsigned ElemsPerVReg = MinVLen / EltTy.getSizeInBits().getFixedValue();
+      unsigned RemIdx = OrigIdx % ElemsPerVReg;
+      unsigned SubRegIdx = OrigIdx / ElemsPerVReg;
+      unsigned ExtractIdx =
+          SubRegIdx * M1Ty.getElementCount().getKnownMinValue();
+      AlignedIdx = ExtractIdx;
+      // Be careful here. Should we be clobbering Idx?
+      MIB.buildConstant(Idx, RemIdx);
+      VecTy = M1Ty;
+    }
+
+    if (AlignedIdx)
+      InsertVec = MIB.buildExtract(VecTy, Dst, AlignedIdx).getReg(0);
+  }
+
+  // TODO: i64-element vectors on RV32 can be lowered without scalar
+  // legalization if the most-significant 32 bits of the value are not affected
+  // by the sign-extension of the lower 32 bits. The Legalizer does not allow
+  // i64-elements through at the moment, so there is no sense in supporting
+  // the selection for this case.
+
+  // Insert into index zero
+
+  auto [Mask, VL] = buildDefaultVLOps(VecTy, MIB, MRI);
+  if (isNullOrNullSplat(*MRI.getVRegDef(Idx), MRI)) {
+    // TODO: Make sure we have fprb tests for regbankselect and legalization
+    // too.
+    unsigned Opc =
+        isRegInFprb(Elt, MRI) ? RISCV::G_VFMV_S_F_VL : RISCV::G_VMV_S_X_VL;
+    auto Move = MIB.buildInstr(Opc, {VecTy}, {InsertVec, Elt, VL});
+    if (AlignedIdx)
+      MIB.buildInsert(Dst, SrcVec, Move, AlignedIdx);
+    return true;
+  }
+
+  // Insert into non-constant or non-zero-constant index
+
+  auto ValInVec = buildScalarInsert(VecTy, Elt, VL, MIB, MRI, STI);
+  // Now that the value is in lane 0 of vector, slide it into position.
+  auto InsertVL = MIB.buildAdd(XLenTy, Idx, MIB.buildConstant(XLenTy, 1));
+  // TODO: SelectionDAG uses tail agnostic policy if Idx is the last index of
+  // Vec. It can do this because it lets in fixed vectors as a legal type. GISel
+  // does not. Can we find a way to use TA if Vec was fixed vector before
+  // legalization?
+  uint64_t Policy = RISCVII::TAIL_UNDISTURBED_MASK_UNDISTURBED;
+  auto Slideup =
+      MIB.buildInstr(RISCV::G_VSLIDEUP_VL, {VecTy},
+                     {InsertVec, ValInVec, Idx, Mask, InsertVL, Policy});
+  // If we used a smaller vector to do the insertion, put the smaller vector
+  // result back into the original vector.
+  if (AlignedIdx)
+    MIB.buildInsert(Dst, SrcVec, Slideup, AlignedIdx);
+
+  return true;
+}
+
 bool RISCVLegalizerInfo::legalizeCustom(
     LegalizerHelper &Helper, MachineInstr &MI,
     LostDebugLocObserver &LocObserver) const {
@@ -577,6 +869,8 @@ bool RISCVLegalizerInfo::legalizeCustom(
   }
   case TargetOpcode::G_VASTART:
     return legalizeVAStart(MI, MIRBuilder);
+  case TargetOpcode::G_INSERT_VECTOR_ELT:
+    return legalizeInsertVectorElt(MI, MIRBuilder);
   }
 
   llvm_unreachable("expected switch to return");
