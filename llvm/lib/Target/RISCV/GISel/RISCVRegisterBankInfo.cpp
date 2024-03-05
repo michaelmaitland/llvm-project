@@ -506,22 +506,6 @@ RISCVRegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
     }
     break;
   }
-  case TargetOpcode::G_INSERT_VECTOR_ELT: {
-    LLT Ty = MRI.getType(MI.getOperand(0).getReg());
-    auto VRBMapping = getVRBValueMapping(Ty.getSizeInBits().getKnownMinValue());
-    OpdsMapping[0] = VRBMapping;
-    OpdsMapping[1] = VRBMapping;
-
-    // FIXME: May need to use anyUseOnlyUseFP in the future, but need to extend
-    // anyUseOnlyUseFP to support FP vectors.
-    MachineInstr *EltDefMI = MRI.getVRegDef(MI.getOperand(2).getReg());
-    OpdsMapping[2] = GPRValueMapping;
-    if (onlyDefinesFP(*EltDefMI, MRI, TRI))
-      OpdsMapping[2] = getFPValueMapping(Ty.getSizeInBits());
-
-    OpdsMapping[3] = GPRValueMapping;
-    break;
-  }
   default:
     // By default map all scalars to GPR.
     for (unsigned Idx = 0; Idx < NumOperands; ++Idx) {
