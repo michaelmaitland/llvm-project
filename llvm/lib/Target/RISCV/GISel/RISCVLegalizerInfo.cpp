@@ -111,34 +111,18 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
       .clampScalar(0, s32, sXLen)
       .minScalarSameAs(1, 0);
 
-  getActionDefinitionsBuilder({G_ZEXT, G_SEXT, G_ANYEXT})
-      .legalIf([=](const LegalityQuery &Query) {
-        unsigned DstSize = Query.Types[0].getSizeInBits();
-
-        // TODO: Handle legal vectors using legalFor
-        if (Query.Types[0].isVector())
-          return false;
-
-        if (DstSize < 8 || DstSize > sXLen.getSizeInBits() ||
-            !isPowerOf2_32(DstSize))
-          return false;
-
-        const LLT &SrcTy = Query.Types[1];
-
-        unsigned SrcSize = SrcTy.getSizeInBits();
-        if (SrcSize < 8 || !isPowerOf2_32(SrcSize))
-          return false;
-
-        return true;
-      })
-      .maxScalar(0, sXLen);
-
   if (ST.is64Bit()) {
+    getActionDefinitionsBuilder({G_ZEXT, G_SEXT, G_ANYEXT})
+        .legalFor({{sXLen, s32}})
+        .maxScalar(0, sXLen);
+
     getActionDefinitionsBuilder(G_SEXT_INREG)
         .customFor({sXLen})
         .maxScalar(0, sXLen)
         .lower();
   } else {
+    getActionDefinitionsBuilder({G_ZEXT, G_SEXT, G_ANYEXT}).maxScalar(0, sXLen);
+
     getActionDefinitionsBuilder(G_SEXT_INREG).maxScalar(0, sXLen).lower();
   }
 
