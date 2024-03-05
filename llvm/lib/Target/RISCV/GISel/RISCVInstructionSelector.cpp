@@ -85,6 +85,7 @@ private:
                          MachineRegisterInfo &MRI) const;
   bool selectUnmergeValues(MachineInstr &MI, MachineIRBuilder &MIB,
                            MachineRegisterInfo &MRI) const;
+
   ComplexRendererFns selectShiftMask(MachineOperand &Root) const;
   ComplexRendererFns selectAddrRegImm(MachineOperand &Root) const;
 

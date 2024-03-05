@@ -111,18 +111,34 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
       .clampScalar(0, s32, sXLen)
       .minScalarSameAs(1, 0);
 
-  if (ST.is64Bit()) {
-    getActionDefinitionsBuilder({G_ZEXT, G_SEXT, G_ANYEXT})
-        .legalFor({{sXLen, s32}})
-        .maxScalar(0, sXLen);
+  getActionDefinitionsBuilder({G_ZEXT, G_SEXT, G_ANYEXT})
+      .legalIf([=](const LegalityQuery &Query) {
+        unsigned DstSize = Query.Types[0].getSizeInBits();
 
+        // TODO: Handle legal vectors using legalFor
+        if (Query.Types[0].isVector())
+          return false;
+
+        if (DstSize < 8 || DstSize > sXLen.getSizeInBits() ||
+            !isPowerOf2_32(DstSize))
+          return false;
+
+        const LLT &SrcTy = Query.Types[1];
+
+        unsigned SrcSize = SrcTy.getSizeInBits();
+        if (SrcSize < 8 || !isPowerOf2_32(SrcSize))
+          return false;
+
+        return true;
+      })
+      .maxScalar(0, sXLen);
+
+  if (ST.is64Bit()) {
     getActionDefinitionsBuilder(G_SEXT_INREG)
         .customFor({sXLen})
         .maxScalar(0, sXLen)
         .lower();
   } else {
-    getActionDefinitionsBuilder({G_ZEXT, G_SEXT, G_ANYEXT}).maxScalar(0, sXLen);
-
     getActionDefinitionsBuilder(G_SEXT_INREG).maxScalar(0, sXLen).lower();
   }
 
@@ -383,20 +399,25 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
       .clampScalar(0, s32, sXLen)
       .lowerForCartesianProduct({s32, sXLen, p0}, {p0});
 
+  // FIXME: need a G_EXTRACT and G_INSERT legalizer and selection patch.
+  getActionDefinitionsBuilder(G_EXTRACT).alwaysLegal();
+  getActionDefinitionsBuilder(G_INSERT).alwaysLegal();
+  getActionDefinitionsBuilder(G_EXTRACT_VECTOR_ELT).alwaysLegal();
+
   getActionDefinitionsBuilder(G_INSERT_VECTOR_ELT)
+      .clampScalar(2, sXLen, sXLen) // clamp Index operand to SXLen
       .customIf(all(
           typeInSet(0, AllVecTys),
           // i64-element vectors on RV32 may be legalized in certain cases.
           typeInSet(1, {s8, s16, s32, s64}),
-          typeInSet(2, {s8, s16, s32, sXLen}),
+          typeInSet(2, {sXLen}),
           LegalityPredicate([=, &ST](const LegalityQuery &Query) {
             return ST.hasVInstructions() &&
                    (Query.Types[0].getScalarSizeInBits() != 64 ||
                     ST.hasVInstructionsI64()) &&
                    (Query.Types[0].getElementCount().getKnownMinValue() != 1 ||
                     ST.getELen() == 64);
-          })))
-      .clampScalar(2, s32, sXLen);
+          })));
 
   getLegacyLegalizerInfo().computeTables();
 }
@@ -527,11 +548,11 @@ static LLT getLMUL1Ty(LLT VecTy) {
                               VecTy.getElementType());
 }
 
-// Given a scalable vector type and an index into it, returns the type for the
-// smallest subvector that the index fits in. This can be used to reduce LMUL
-// for operations like vslidedown.
-//
-// E.g. With Zvl128b, index 3 in a nxv4i32 fits within the first nxv2i32.
+/// Given a scalable vector type and an index into it, returns the type for the
+/// smallest subvector that the index fits in. This can be used to reduce LMUL
+/// for operations like vslidedown.
+///
+/// E.g. With Zvl128b, index 3 in a nxv4i32 fits within the first nxv2i32.
 static std::optional<LLT>
 getSmallestLLTForIndex(LLT VecTy, unsigned MaxIdx,
                        const RISCVSubtarget &Subtarget) {
@@ -543,7 +564,7 @@ getSmallestLLTForIndex(LLT VecTy, unsigned MaxIdx,
   if (MaxIdx < MinVLMAX)
     SmallerTy = getLMUL1Ty(VecTy);
   else if (MaxIdx < MinVLMAX * 2)
-    SmallerTy  = getLMUL1Ty(VecTy).multiplyElements(2);
+    SmallerTy = getLMUL1Ty(VecTy).multiplyElements(2);
   else if (MaxIdx < MinVLMAX * 4)
     SmallerTy = getLMUL1Ty(VecTy).multiplyElements(4);
   if (!SmallerTy.isValid() ||
@@ -583,53 +604,13 @@ buildDefaultVLOps(const DstOp &Dst, MachineIRBuilder &MIB,
 }
 
 static MachineInstrBuilder
-buildSplatPartsI64WithVL(const DstOp &Dst, const SrcOp &Passthru, Register Lo,
+buildSplatPartsS64WithVL(const DstOp &Dst, const SrcOp &Passthru, Register Lo,
                          Register Hi, Register VL, MachineIRBuilder &MIB,
                          MachineRegisterInfo &MRI) {
-
-  if (std::optional<int64_t> LoC = getIConstantSplatSExtVal(Lo, MRI),
-      HiC = getIConstantSplatSExtVal(Hi, MRI);
-      LoC && HiC) {
-    // If Hi constant is all the same sign bit as Lo, lower this as a custom
-    // node in order to try and match RVV vector/scalar instructions.
-    if ((*LoC >> 31) == *HiC)
-      return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst}, {Passthru, Lo, VL});
-
-    // If vl is equal to VLMAX or fits in 4 bits and Hi constant is equal to Lo,
-    // we could use vmv.v.x whose EEW = 32 to lower it. This allows us to use
-    // vlmax vsetvli or vsetivli to change the VL.
-    // FIXME: Support larger constants?
-    // FIXME: Support non-constant VLs by saturating?
-    Register NewVL = VL;
-    if (*LoC == *HiC) {
-      if (isAllOnesOrAllOnesSplat(*MRI.getVRegDef(VL), MRI) || VL == RISCV::X0)
-        NewVL = Register(RISCV::X0);
-      else if (auto VLC = getIConstantSplatVal(VL, MRI);
-               isUInt<4>(VLC->getZExtValue()))
-        NewVL = MIB.buildAdd({MRI.getType(VL)}, VL, VL).getReg(0);
-
-      if (NewVL) {
-        LLT InterVecTy = LLT::vector(
-            Dst.getLLTTy(MRI).getElementCount().multiplyCoefficientBy(2), 32);
-        auto InterVec = MIB.buildInstr(RISCV::G_VMV_V_X_VL, {InterVecTy},
-                                       {MIB.buildUndef(InterVecTy), Lo, NewVL});
-        return MIB.buildBitcast(Dst, InterVec);
-      }
-    }
-  }
-
-  // Detect cases where Hi is (SRA Lo, 31) which means Hi is Lo sign extended.
-  MachineInstr *HiMI = MRI.getVRegDef(Hi);
-  MachineInstr *HiMiOp2Def = MRI.getVRegDef(HiMI->getOperand(2).getReg());
-  if (HiMI->getOpcode() == TargetOpcode::G_ASHR &&
-      HiMI->getOperand(1).getReg() == Lo)
-    if (auto C = getIConstantSplatSExtVal(*HiMiOp2Def, MRI); *C == 31)
-      return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst}, {Passthru, Lo, VL});
-
-  // If the Hi bits of the splat are undefined, then it's fine to just splat
-  // Lo even if it might be sign extended.
-  if (HiMI->getOpcode() == TargetOpcode::G_IMPLICIT_DEF)
-    return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst}, {Passthru, Lo, VL});
+  // TODO: If the Hi bits of the splat are undefined, then it's fine to just
+  // splat Lo even if it might be sign extended. I don't think we have
+  // introduced a case where we're build a s64 where the upper bits are undef
+  // yet.
 
   // Fall back to a stack store and stride x0 vector load.
   // TODO: need to lower G_SPLAT_VECTOR_SPLIT_I64. This is done in
@@ -639,12 +620,12 @@ buildSplatPartsI64WithVL(const DstOp &Dst, const SrcOp &Passthru, Register Lo,
 }
 
 static MachineInstrBuilder
-buildSplatSplitI64WithVL(const DstOp &Dst, const SrcOp &Passthru,
+buildSplatSplitS64WithVL(const DstOp &Dst, const SrcOp &Passthru,
                          const SrcOp &Scalar, Register VL,
                          MachineIRBuilder &MIB, MachineRegisterInfo &MRI) {
   assert(Scalar.getLLTTy(MRI) == LLT::scalar(64) && "Unexpected VecTy!");
   auto Unmerge = MIB.buildUnmerge(LLT::scalar(32), Scalar);
-  return buildSplatPartsI64WithVL(Dst, Passthru, Unmerge.getReg(0),
+  return buildSplatPartsS64WithVL(Dst, Passthru, Unmerge.getReg(0),
                                   Unmerge.getReg(1), VL, MIB, MRI);
 }
 
@@ -652,14 +633,67 @@ static MachineInstrBuilder
 buildScalarSplat(const DstOp &Dst, const SrcOp &Passthru, Register Scalar,
                  Register VL, MachineIRBuilder &MIB, MachineRegisterInfo &MRI,
                  const RISCVSubtarget &Subtarget) {
-  if (isRegInFprb(Scalar, MRI))
-    return MIB.buildInstr(RISCV::G_VFMV_V_F_VL, {Dst}, {Passthru, Scalar, VL});
-
   const LLT XLenTy(Subtarget.getXLenVT());
 
-  // Simplest case is that the operand needs to be promoted to XLenTy.
+  // TODO: Simplest case is that the operand needs to be promoted to XLenTy.
+  // Currently the only call to buildScalarSplat occurs when
+  // isKnownGT(ScalarTySize, XLenTySize) so we don't need to hanle this case
+  // yet.
+
   LLT ScalarTy = MRI.getType(Scalar);
-  if (TypeSize::isKnownLE(ScalarTy.getSizeInBits(), XLenTy.getSizeInBits())) {
+
+  assert(XLenTy == LLT::scalar(32) && ScalarTy == LLT::scalar(64) &&
+         "Unexpected scalar for splat lowering!");
+
+  if (auto C = getIConstantVRegSExtVal(VL, MRI);
+      *C == 1 && isNullOrNullSplat(*MRI.getVRegDef(Scalar), MRI))
+    return MIB.buildInstr(RISCV::G_SCALAR_MOVE_VL, {Dst},
+                          {Passthru, MIB.buildConstant(XLenTy, 0), VL});
+
+  // Otherwise use the more complicated splatting algorithm.
+  return buildSplatSplitS64WithVL(Dst, Passthru, Scalar, VL, MIB, MRI);
+}
+
+// This function lowers an insert of a scalar operand Scalar into lane
+// 0 of the vector regardless of the value of VL.  The contents of the
+// remaining lanes of the result vector are unspecified.  VL is assumed
+// to be non-zero.
+static MachineInstrBuilder buildScalarInsert(const DstOp &Dst, Register Scalar,
+                                             const SrcOp &VL,
+                                             MachineIRBuilder &MIB,
+                                             MachineRegisterInfo &MRI,
+                                             const RISCVSubtarget &Subtarget) {
+  LLT VecTy = Dst.getLLTTy(MRI);
+  assert(VecTy.isScalableVector() && "Expect Dst is scalable vector type.");
+
+  const LLT XLenTy(Subtarget.getXLenVT());
+  auto Undef = MIB.buildUndef(VecTy);
+
+  // Dst = G_INSERT_VECTOR_ELT Undef (G_EXTRACT_VECTOR_ELT V 0) N -> Dst = V
+  MachineInstr *ScalarMI = MRI.getVRegDef(Scalar);
+  if (ScalarMI->getOpcode() == TargetOpcode::G_EXTRACT_VECTOR_ELT &&
+      isNullOrNullSplat(*MRI.getVRegDef(ScalarMI->getOperand(2).getReg()),
+                        MRI)) {
+    Register V = ScalarMI->getOperand(1).getReg();
+    LLT VTy = MRI.getType(V);
+    // If V is not big enough, merge it with Undef.
+    if (TypeSize::isKnownLE(VTy.getSizeInBits(), VecTy.getSizeInBits()))
+      return MIB.buildInsert(Dst, Undef, Scalar, 0);
+    // V is as big or bigger then VecTy. Use an extract to get the correct Dst
+    // type.
+    return MIB.buildExtract(Dst, V, 0);
+  }
+
+  // Avoid the tricky legalization cases by falling back to using the
+  // splat code which already handles it gracefully.
+  LLT ScalarTy = MRI.getType(Scalar);
+  if (TypeSize::isKnownGT(ScalarTy.getSizeInBits(), XLenTy.getSizeInBits()))
+    return buildScalarSplat(Dst, Undef, Scalar,
+                            MIB.buildConstant(XLenTy, 1).getReg(0), MIB, MRI,
+                            Subtarget);
+
+  Register ExtScalar = Scalar;
+  if (TypeSize::isKnownLT(ScalarTy.getSizeInBits(), XLenTy.getSizeInBits())) {
     // If the operand is a constant, sign extend to increase our chances
     // of being able to use a .vi instruction. ANY_EXTEND would become a
     // a zero extend and the simm5 check in isel would fail.
@@ -667,53 +701,16 @@ buildScalarSplat(const DstOp &Dst, const SrcOp &Passthru, Register Scalar,
     unsigned ExtOpc = isConstantOrConstantVector(*MRI.getVRegDef(Scalar), MRI)
                           ? TargetOpcode::G_SEXT
                           : TargetOpcode::G_ANYEXT;
-    auto ExtScalar = MIB.buildInstr(ExtOpc, {XLenTy}, {Scalar});
-    return MIB.buildInstr(RISCV::G_VMV_V_X_VL, {Dst},
-                          {Passthru, ExtScalar, VL});
+    ExtScalar = MIB.buildInstr(ExtOpc, {XLenTy}, {Scalar}).getReg(0);
   }
-
-  assert(XLenTy == LLT::scalar(32) && ScalarTy == LLT::scalar(64) &&
-         "Unexpected scalar for splat lowering!");
-
-  if (isAllOnesOrAllOnesSplat(*MRI.getVRegDef(VL), MRI) &&
-      isNullOrNullSplat(*MRI.getVRegDef(Scalar), MRI))
-    return MIB.buildInstr(RISCV::G_VMV_S_X_VL, {Dst},
-                          {Passthru, MIB.buildConstant(XLenTy, 0), VL});
-
-  // Otherwise use the more complicated splatting algorithm.
-  return buildSplatSplitI64WithVL(Dst, Passthru, Scalar, VL, MIB, MRI);
+  return MIB.buildInstr(RISCV::G_SCALAR_MOVE_VL, {Dst}, {Undef, ExtScalar, VL});
 }
 
-static MachineInstrBuilder
-buildScalarInsert(const DstOp &Dst, Register Scalar, const SrcOp &VL,
-                  MachineIRBuilder &MIB, MachineRegisterInfo &MRI,
-                  const RISCVSubtarget &Subtarget) {
-  LLT VecTy = Dst.getLLTTy(MRI);
-  assert(VecTy.isScalableVector() && "Expect Dst is scalable vector type.");
-
-  const LLT XLenTy(Subtarget.getXLenVT());
-
-  auto Undef = MIB.buildUndef(VecTy);
-  if (isRegInFprb(Scalar, MRI))
-    return MIB.buildInstr(RISCV::G_VFMV_S_F_VL, {Dst}, {Undef, Scalar, VL});
-
-  // Avoid the tricky legalization cases by falling back to using the
-  // splat code which already handles it gracefully.
-  LLT ScalarTy = MRI.getType(Scalar);
-  if (!TypeSize::isKnownLE(ScalarTy.getSizeInBits(), XLenTy.getSizeInBits()))
-    return buildScalarSplat(Dst, Undef, Scalar,
-                            MIB.buildConstant(XLenTy, 1).getReg(0), MIB, MRI,
-                            Subtarget);
-
-  // TODO: check whether we need the EXTEND that SelectionDAG has.
-  return MIB.buildInstr(RISCV::G_VMV_S_X_VL, {Dst}, {Undef, Scalar, VL});
-}
-
-/// Insert into the first position of a vector, and that vector is slid up to the
-/// insert index. By limiting the active vector length to index+1 and merging
-/// with the original vector (with an undisturbed tail policy for elements >=
-/// VL), we achieve the desired result of leaving all elements untouched except
-/// the one at VL-1, which is replaced with the desired value.
+/// Insert into the first position of a vector, and that vector is slid up to
+/// the insert index. By limiting the active vector length to index+1 and
+/// merging with the original vector (with an undisturbed tail policy for
+/// elements >= VL), we achieve the desired result of leaving all elements
+/// untouched except the one at VL-1, which is replaced with the desired value.
 bool RISCVLegalizerInfo::legalizeInsertVectorElt(MachineInstr &MI,
                                                  MachineIRBuilder &MIB) const {
   assert(MI.getOpcode() == TargetOpcode::G_INSERT_VECTOR_ELT);
@@ -742,6 +739,7 @@ bool RISCVLegalizerInfo::legalizeInsertVectorElt(MachineInstr &MI,
   // vector.
   unsigned AlignedIdx = 0;
   auto InsertVec = SrcVec;
+  auto NewIdx = Idx;
   if (auto ConstIdxOpt = getIConstantVRegVal(Idx, MRI)) {
     const unsigned OrigIdx = ConstIdxOpt->getZExtValue();
     // Do we know an upper bound on LMUL?
@@ -755,20 +753,19 @@ bool RISCVLegalizerInfo::legalizeInsertVectorElt(MachineInstr &MI,
     const unsigned MaxVLen = STI.getRealMaxVLen();
     const LLT M1Ty = getLMUL1Ty(VecTy);
     if (MinVLen == MaxVLen &&
-        TypeSize::isKnownGT(VecTy.getSizeInBits(), M1Ty.getSizeInBits())) {
+        VecTy.getSizeInBits().getKnownMinValue() > MinVLen) {
       unsigned ElemsPerVReg = MinVLen / EltTy.getSizeInBits().getFixedValue();
       unsigned RemIdx = OrigIdx % ElemsPerVReg;
       unsigned SubRegIdx = OrigIdx / ElemsPerVReg;
       unsigned ExtractIdx =
           SubRegIdx * M1Ty.getElementCount().getKnownMinValue();
       AlignedIdx = ExtractIdx;
-      // Be careful here. Should we be clobbering Idx?
-      MIB.buildConstant(Idx, RemIdx);
+      NewIdx = MIB.buildConstant(MRI.getType(Idx), RemIdx).getReg(0);
       VecTy = M1Ty;
     }
 
     if (AlignedIdx)
-      InsertVec = MIB.buildExtract(VecTy, Dst, AlignedIdx).getReg(0);
+      InsertVec = MIB.buildExtract(VecTy, SrcVec, AlignedIdx).getReg(0);
   }
 
   // TODO: i64-element vectors on RV32 can be lowered without scalar
@@ -780,14 +777,15 @@ bool RISCVLegalizerInfo::legalizeInsertVectorElt(MachineInstr &MI,
   // Insert into index zero
 
   auto [Mask, VL] = buildDefaultVLOps(VecTy, MIB, MRI);
-  if (isNullOrNullSplat(*MRI.getVRegDef(Idx), MRI)) {
+  if (isNullOrNullSplat(*MRI.getVRegDef(NewIdx), MRI)) {
     // TODO: Make sure we have fprb tests for regbankselect and legalization
     // too.
-    unsigned Opc =
-        isRegInFprb(Elt, MRI) ? RISCV::G_VFMV_S_F_VL : RISCV::G_VMV_S_X_VL;
-    auto Move = MIB.buildInstr(Opc, {VecTy}, {InsertVec, Elt, VL});
+    auto Move =
+        MIB.buildInstr(RISCV::G_SCALAR_MOVE_VL, {VecTy}, {InsertVec, Elt, VL});
     if (AlignedIdx)
-      MIB.buildInsert(Dst, SrcVec, Move, AlignedIdx);
+      MIB.buildInsert(Dst, InsertVec, Move, AlignedIdx);
+
+    MI.eraseFromParent();
     return true;
   }
 
@@ -795,7 +793,7 @@ bool RISCVLegalizerInfo::legalizeInsertVectorElt(MachineInstr &MI,
 
   auto ValInVec = buildScalarInsert(VecTy, Elt, VL, MIB, MRI, STI);
   // Now that the value is in lane 0 of vector, slide it into position.
-  auto InsertVL = MIB.buildAdd(XLenTy, Idx, MIB.buildConstant(XLenTy, 1));
+  auto InsertVL = MIB.buildAdd(XLenTy, NewIdx, MIB.buildConstant(XLenTy, 1));
   // TODO: SelectionDAG uses tail agnostic policy if Idx is the last index of
   // Vec. It can do this because it lets in fixed vectors as a legal type. GISel
   // does not. Can we find a way to use TA if Vec was fixed vector before
@@ -803,12 +801,13 @@ bool RISCVLegalizerInfo::legalizeInsertVectorElt(MachineInstr &MI,
   uint64_t Policy = RISCVII::TAIL_UNDISTURBED_MASK_UNDISTURBED;
   auto Slideup =
       MIB.buildInstr(RISCV::G_VSLIDEUP_VL, {VecTy},
-                     {InsertVec, ValInVec, Idx, Mask, InsertVL, Policy});
+                     {InsertVec, ValInVec, NewIdx, Mask, InsertVL, Policy});
   // If we used a smaller vector to do the insertion, put the smaller vector
   // result back into the original vector.
   if (AlignedIdx)
-    MIB.buildInsert(Dst, SrcVec, Slideup, AlignedIdx);
+    MIB.buildInsert(Dst, InsertVec, Slideup, AlignedIdx);
 
+  MI.eraseFromParent();
   return true;
 }
 
