@@ -2868,12 +2868,9 @@ void SchedBoundary::releasePending() {
 
 /// Remove SU from the ready set for this boundary.
 void SchedBoundary::removeReady(SUnit *SU) {
-  if (Available.isInQueue(SU))
-    Available.remove(Available.find(SU));
-  else {
-    assert(Pending.isInQueue(SU) && "bad ready count");
-    Pending.remove(Pending.find(SU));
-  }
+  // The ready set is implemented by the Available queue.
+  assert(Available.isInQueue(SU) && "Ready nodes must be in Available queue");
+  Available.remove(Available.find(SU));
 }
 
 /// If this queue only has one ready candidate, return it. As a side effect,

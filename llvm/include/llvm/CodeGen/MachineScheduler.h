@@ -1049,6 +1049,7 @@ public:
 
   void releasePending();
 
+  /// Remove SU from the Ready set for this boundary.
   void removeReady(SUnit *SU);
 
   /// Call this before applying any other heuristics to the Available queue.
