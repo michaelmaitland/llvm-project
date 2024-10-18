@@ -1077,6 +1077,33 @@ llvm::ConstantFoldICmp(unsigned Pred, const Register Op1, const Register Op2,
   return std::nullopt;
 }
 
+bool llvm::isKnownNeverZero(Register Reg, const MachineRegisterInfo &MRI,
+                            GISelKnownBits *KB) {
+  std::optional<DefinitionAndSourceRegister> DefSrcReg =
+      getDefSrcRegIgnoringCopies(Reg, MRI);
+  if (!DefSrcReg)
+    return false;
+
+  const MachineInstr &MI = *DefSrcReg->MI;
+  const LLT Ty = MRI.getType(Reg);
+
+  switch (MI.getOpcode()) {
+  case TargetOpcode::G_VSCALE: {
+    const Function &F = MI.getParent()->getParent()->getFunction();
+    const APInt &Multiplier = MI.getOperand(1).getCImm()->getValue();
+    ConstantRange CR =
+        getVScaleRange(&F, Ty.getScalarSizeInBits()).multiply(Multiplier);
+    if (!CR.contains(APInt(CR.getBitWidth(), 0)))
+      return true;
+    break;
+  }
+  default:
+    break;
+  }
+
+  return KB && KB->getKnownBits(Reg).isNonZero();
+}
+
 bool llvm::isKnownToBeAPowerOfTwo(Register Reg, const MachineRegisterInfo &MRI,
                                   GISelKnownBits *KB) {
   std::optional<DefinitionAndSourceRegister> DefSrcReg =
@@ -1098,11 +1125,13 @@ bool llvm::isKnownToBeAPowerOfTwo(Register Reg, const MachineRegisterInfo &MRI,
     // shifting the bit off the end is undefined.
 
     // TODO: Constant splat
-    if (auto ConstLHS = getIConstantVRegVal(MI.getOperand(1).getReg(), MRI)) {
+    Register LHS = MI.getOperand(1).getReg();
+    if (auto ConstLHS = getIConstantVRegVal(LHS, MRI)) {
       if (*ConstLHS == 1)
         return true;
     }
-
+    if (isKnownToBeAPowerOfTwo(LHS, MRI, KB) && isKnownNeverZero(LHS, MRI, KB))
+      return true;
     break;
   }
   case TargetOpcode::G_LSHR: {
@@ -1132,6 +1161,9 @@ bool llvm::isKnownToBeAPowerOfTwo(Register Reg, const MachineRegisterInfo &MRI,
         return false;
     }
 
+    return true;
+  }
+  case TargetOpcode::G_VSCALE: {
     return true;
   }
   default:

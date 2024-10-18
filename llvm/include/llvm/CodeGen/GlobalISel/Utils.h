@@ -339,6 +339,10 @@ inline bool isKnownNeverSNaN(Register Val, const MachineRegisterInfo &MRI) {
   return isKnownNeverNaN(Val, MRI, true);
 }
 
+/// Test whether Reg is known to contain non-zero value(s).
+bool isKnownNeverZero(Register Reg, const MachineRegisterInfo &MRI,
+                      GISelKnownBits *KnownBits = nullptr);
+
 Align inferAlignFromPtrInfo(MachineFunction &MF, const MachinePointerInfo &MPO);
 
 /// Return a virtual register corresponding to the incoming argument register \p
