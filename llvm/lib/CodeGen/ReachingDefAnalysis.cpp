@@ -147,17 +147,19 @@ void ReachingDefAnalysis::processDefs(MachineInstr *MI) {
       assert(FrameIndex >= 0 && "Can't handle negative frame indicies yet!");
       if (!isFIDef(*MI, FrameIndex, TII))
         continue;
+
+      int Key = FrameIndex - ObjectIndexBegin;
       if (MBBFrameObjsReachingDefs.contains(MBBNumber)) {
-        auto Frame2InstrIdx = MBBFrameObjsReachingDefs[MBBNumber];
-        if (Frame2InstrIdx.count(FrameIndex - ObjectIndexBegin) > 0)
-          Frame2InstrIdx[FrameIndex - ObjectIndexBegin].push_back(CurInstr);
+        auto &Frame2InstrIdx = MBBFrameObjsReachingDefs[MBBNumber];
+        if (Frame2InstrIdx.count(Key) > 0)
+          Frame2InstrIdx[Key].push_back(CurInstr);
         else
-          Frame2InstrIdx[FrameIndex - ObjectIndexBegin] = {CurInstr};
+          Frame2InstrIdx[Key] = {CurInstr};
       } else {
-        MBBFrameObjsReachingDefs[MBBNumber] = {
-            {FrameIndex - ObjectIndexBegin, {CurInstr}}};
+        MBBFrameObjsReachingDefs[MBBNumber] = {{Key, {CurInstr}}};
       }
     }
+
     if (!isValidRegDef(MO))
       continue;
     for (MCRegUnit Unit : TRI->regunits(MO.getReg().asMCReg())) {
@@ -348,8 +350,8 @@ int ReachingDefAnalysis::getReachingDef(MachineInstr *MI, Register Reg) const {
 
   if (Register::isStackSlot(Reg)) {
     int FrameIndex = Register::stackSlot2Index(Reg);
-    for (int Def : MBBFrameObjsReachingDefs.lookup(MBBNumber).lookup(
-             FrameIndex - ObjectIndexBegin)) {
+    int Key = FrameIndex - ObjectIndexBegin;
+    for (int Def : MBBFrameObjsReachingDefs.at(MBBNumber).at(Key)) {
       if (Def >= InstId)
         break;
       DefRes = Def;
