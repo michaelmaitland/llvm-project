@@ -210,3 +210,24 @@ int f14(int x) {
     return x;
   }
 }
+
+#define PERIODIC_CASE(N)                                                     \
+  if (n == (N))                                                              \
+    return ((N) & 1) == 0;
+#define PERIODIC_CASE_2(N) PERIODIC_CASE(N) PERIODIC_CASE((N) + 1)
+#define PERIODIC_CASE_4(N) PERIODIC_CASE_2(N) PERIODIC_CASE_2((N) + 2)
+#define PERIODIC_CASE_8(N) PERIODIC_CASE_4(N) PERIODIC_CASE_4((N) + 4)
+#define PERIODIC_CASE_16(N) PERIODIC_CASE_8(N) PERIODIC_CASE_8((N) + 8)
+#define PERIODIC_CASE_32(N) PERIODIC_CASE_16(N) PERIODIC_CASE_16((N) + 16)
+#define PERIODIC_CASE_64(N) PERIODIC_CASE_32(N) PERIODIC_CASE_32((N) + 32)
+#define PERIODIC_CASE_128(N) PERIODIC_CASE_64(N) PERIODIC_CASE_64((N) + 64)
+#define PERIODIC_CASE_256(N) PERIODIC_CASE_128(N) PERIODIC_CASE_128((N) + 128)
+
+// CHECK-LABEL: define{{.*}} i1 @periodic_is_even(
+// CHECK: [[LOW_BIT:%.*]] = trunc i8 %{{.*}} to i1
+// CHECK-NEXT: [[IS_EVEN:%.*]] = xor i1 [[LOW_BIT]], true
+// CHECK-NEXT: ret i1 [[IS_EVEN]]
+_Bool periodic_is_even(unsigned char n) {
+  PERIODIC_CASE_256(0)
+  return 0;
+}

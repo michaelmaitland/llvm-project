@@ -866,8 +866,14 @@ Value *SimplifyCFGOpt::isValueEqualityComparison(Instruction *TI) {
   Value *CV = nullptr;
   if (SwitchInst *SI = dyn_cast<SwitchInst>(TI)) {
     // Do not permit merging of large switch instructions into their
-    // predecessors unless there is only one predecessor.
-    if (!SI->getParent()->hasNPredecessorsOrMore(128 / SI->getNumSuccessors()))
+    // predecessors unless there is only one predecessor. Small integer
+    // conditions have a bounded number of cases and may become exhaustive,
+    // enabling the switch to be replaced with arithmetic.
+    bool HasSmallFiniteDomain =
+        SI->getCondition()->getType()->getIntegerBitWidth() <= 8;
+    if (HasSmallFiniteDomain ||
+        !SI->getParent()->hasNPredecessorsOrMore(128 /
+                                                SI->getNumSuccessors()))
       CV = SI->getCondition();
   } else if (CondBrInst *BI = dyn_cast<CondBrInst>(TI))
     if (BI->getCondition()->hasOneUse()) {
@@ -6954,6 +6960,9 @@ private:
   ConstantInt *LinearMultiplier = nullptr;
   bool LinearMapValWrapped = false;
 
+  // A mask that reduces a repeating table to its smallest power-of-two period.
+  ConstantInt *IndexMask = nullptr;
+
   // For LookupTableKind, this is the table.
   Constant *Initializer = nullptr;
 };
@@ -7010,60 +7019,97 @@ SwitchReplacement::SwitchReplacement(
     return;
   }
 
-  // Check if we can derive the value with a linear transformation from the
-  // table index.
-  if (isa<IntegerType>(ValueType)) {
-    bool LinearMappingPossible = true;
+  auto GetLinearMapping = [&](ArrayRef<Constant *> Contents)
+      -> std::optional<std::pair<APInt, bool>> {
+    if (!isa<IntegerType>(ValueType))
+      return std::nullopt;
+
     APInt PrevVal;
     APInt DistToPrev;
-    // When linear map is monotonic and signed overflow doesn't happen on
-    // maximum index, we can attach nsw on Add and Mul.
     bool NonMonotonic = false;
-    assert(TableSize >= 2 && "Should be a SingleValue table.");
-    // Check if there is the same distance between two consecutive values.
-    for (uint64_t I = 0; I < TableSize; ++I) {
-      ConstantInt *ConstVal = dyn_cast<ConstantInt>(TableContents[I]);
+    for (uint64_t I = 0; I < Contents.size(); ++I) {
+      ConstantInt *ConstVal = dyn_cast<ConstantInt>(Contents[I]);
 
-      if (!ConstVal && isa<PoisonValue>(TableContents[I])) {
-        // This is an poison, so it's (probably) a lookup table hole.
-        // To prevent any regressions from before we switched to using poison as
-        // the default value, holes will fall back to using the first value.
-        // This can be removed once we add proper handling for poisons in lookup
+      if (!ConstVal && isa<PoisonValue>(Contents[I])) {
+        // This is poison, so it's (probably) a lookup table hole. To prevent
+        // any regressions from before we switched to using poison as the
+        // default value, holes will fall back to using the first value. This
+        // can be removed once we add proper handling for poisons in lookup
         // tables.
         ConstVal = dyn_cast<ConstantInt>(Values[0].second);
       }
 
-      if (!ConstVal) {
-        // This is an undef. We could deal with it, but undefs in lookup tables
-        // are very seldom. It's probably not worth the additional complexity.
-        LinearMappingPossible = false;
-        break;
-      }
+      if (!ConstVal)
+        return std::nullopt;
+
       const APInt &Val = ConstVal->getValue();
       if (I != 0) {
         APInt Dist = Val - PrevVal;
-        if (I == 1) {
+        if (I == 1)
           DistToPrev = Dist;
-        } else if (Dist != DistToPrev) {
-          LinearMappingPossible = false;
-          break;
-        }
+        else if (Dist != DistToPrev)
+          return std::nullopt;
         NonMonotonic |=
             Dist.isStrictlyPositive() ? Val.sle(PrevVal) : Val.sgt(PrevVal);
       }
       PrevVal = Val;
     }
-    if (LinearMappingPossible) {
-      LinearOffset = cast<ConstantInt>(TableContents[0]);
-      LinearMultiplier = ConstantInt::get(M.getContext(), DistToPrev);
-      APInt M = LinearMultiplier->getValue();
-      bool MayWrap = true;
-      if (isIntN(M.getBitWidth(), TableSize - 1))
-        (void)M.smul_ov(APInt(M.getBitWidth(), TableSize - 1), MayWrap);
-      LinearMapValWrapped = NonMonotonic || MayWrap;
-      Kind = LinearMapKind;
-      return;
+    return std::make_pair(DistToPrev, NonMonotonic);
+  };
+
+  // Reduce repeating tables before choosing their representation. Restricting
+  // the period to a power of two keeps index reduction to a single bitwise and.
+  for (uint64_t Period = 2; Period < TableSize; Period *= 2) {
+    bool IsPeriodic = true;
+    for (uint64_t I = Period; I < TableSize; ++I) {
+      if (TableContents[I] != TableContents[I % Period]) {
+        IsPeriodic = false;
+        break;
+      }
     }
+    if (IsPeriodic) {
+      // A short matching suffix is often incidental and is not enough to
+      // justify adding an index mask to every lookup. Require two complete
+      // periods unless shortening the table eliminates the lookup by enabling
+      // a linear map or bitmap representation.
+      bool HasTwoCompletePeriods = Period <= TableSize / 2;
+      if (!HasTwoCompletePeriods) {
+        ArrayRef<Constant *> PeriodContents(TableContents.data(), Period);
+        bool EnablesLinearMap = !GetLinearMapping(TableContents) &&
+                                GetLinearMapping(PeriodContents);
+        bool EnablesBitMap = !wouldFitInRegister(DL, TableSize, ValueType) &&
+                             wouldFitInRegister(DL, Period, ValueType);
+        if (!EnablesLinearMap && !EnablesBitMap)
+          continue;
+      }
+
+      IndexMask =
+          ConstantInt::get(cast<IntegerType>(Offset->getType()), Period - 1);
+      TableSize = Period;
+      TableContents.resize(TableSize);
+      break;
+    }
+    if (Period > UINT64_MAX / 2)
+      break;
+  }
+
+  // Check if we can derive the value with a linear transformation from the
+  // table index.
+  assert(TableSize >= 2 && "Should be a SingleValue table.");
+  if (auto LinearMapping = GetLinearMapping(TableContents)) {
+    const APInt &DistToPrev = LinearMapping->first;
+    // When linear map is monotonic and signed overflow doesn't happen on
+    // maximum index, we can attach nsw on Add and Mul.
+    bool NonMonotonic = LinearMapping->second;
+    LinearOffset = cast<ConstantInt>(TableContents[0]);
+    LinearMultiplier = ConstantInt::get(M.getContext(), DistToPrev);
+    APInt M = LinearMultiplier->getValue();
+    bool MayWrap = true;
+    if (isIntN(M.getBitWidth(), TableSize - 1))
+      (void)M.smul_ov(APInt(M.getBitWidth(), TableSize - 1), MayWrap);
+    LinearMapValWrapped = NonMonotonic || MayWrap;
+    Kind = LinearMapKind;
+    return;
   }
 
   // If the type is integer and the table fits in a register, build a bitmap.
@@ -7109,6 +7155,9 @@ SwitchReplacement::SwitchReplacement(
 
 Value *SwitchReplacement::replaceSwitch(Value *Index, IRBuilder<> &Builder,
                                         const DataLayout &DL, Function *Func) {
+  if (IndexMask)
+    Index = Builder.CreateAnd(Index, IndexMask, "switch.idx.mask");
+
   switch (Kind) {
   case SingleValueKind:
     return SingleValue;
@@ -7545,7 +7594,35 @@ static bool simplifySwitchLookup(SwitchInst *SI, IRBuilder<> &Builder,
       return false;
   }
 
-  if (!shouldBuildLookupTable(SI, TableSize, TTI, DL, ResultTypes))
+  bool ShouldBuildLookupTable =
+      shouldBuildLookupTable(SI, TableSize, TTI, DL, ResultTypes);
+  if (!ShouldBuildLookupTable &&
+      (SI->getNumCases() > TableSize ||
+       !isSwitchDense(SI->getNumCases(), TableSize,
+                      SI->getFunction()->hasOptSize())))
+    return false;
+
+  // Keep track of the switch replacement for each phi.
+  SmallDenseMap<PHINode *, SwitchReplacement> PhiToReplacementMap;
+  for (PHINode *PHI : PHIs) {
+    const auto &ResultList = ResultLists[PHI];
+
+    Type *ResultType = ResultList.begin()->second->getType();
+    // Use any value to fill the lookup table holes.
+    Constant *DefaultVal =
+        AllHolesArePoison ? PoisonValue::get(ResultType) : DefaultResults[PHI];
+    StringRef FuncName = Fn->getName();
+    SwitchReplacement Replacement(*Fn->getParent(), TableSize, TableIndexOffset,
+                                  ResultList, DefaultVal, DL, TTI, FuncName);
+    PhiToReplacementMap.insert({PHI, Replacement});
+  }
+
+  bool AnyLookupTables = any_of(
+      PhiToReplacementMap, [](auto &KV) { return KV.second.isLookupTable(); });
+  bool AnyBitMaps = any_of(PhiToReplacementMap,
+                           [](auto &KV) { return KV.second.isBitMap(); });
+
+  if (AnyLookupTables && !ShouldBuildLookupTable)
     return false;
 
   // Compute the table index value.
@@ -7577,26 +7654,6 @@ static bool simplifySwitchLookup(SwitchInst *SI, IRBuilder<> &Builder,
       }
     }
   }
-
-  // Keep track of the switch replacement for each phi
-  SmallDenseMap<PHINode *, SwitchReplacement> PhiToReplacementMap;
-  for (PHINode *PHI : PHIs) {
-    const auto &ResultList = ResultLists[PHI];
-
-    Type *ResultType = ResultList.begin()->second->getType();
-    // Use any value to fill the lookup table holes.
-    Constant *DefaultVal =
-        AllHolesArePoison ? PoisonValue::get(ResultType) : DefaultResults[PHI];
-    StringRef FuncName = Fn->getName();
-    SwitchReplacement Replacement(*Fn->getParent(), TableSize, TableIndexOffset,
-                                  ResultList, DefaultVal, DL, TTI, FuncName);
-    PhiToReplacementMap.insert({PHI, Replacement});
-  }
-
-  bool AnyLookupTables = any_of(
-      PhiToReplacementMap, [](auto &KV) { return KV.second.isLookupTable(); });
-  bool AnyBitMaps = any_of(PhiToReplacementMap,
-                           [](auto &KV) { return KV.second.isBitMap(); });
 
   // A few conditions prevent the generation of lookup tables:
   //     1. The target does not support lookup tables.
